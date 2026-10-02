@@ -28,7 +28,8 @@ USER_AGENT = "Mozilla/5.0 (personal offline reading; epub export)"
 
 # Paths that are navigation rather than essays.
 SKIP_PATH = re.compile(
-    r"^/(about|contact|now|tags?|categor(y|ies)|page|feed|rss|archive|search|subscribe|privacy)(/|$)",
+    r"^/(about|contact|now|tags?|categor(y|ies)|page|feed|rss|archive|search|subscribe|privacy"
+    r"|books|movies|reading-lists)(/|$)",
     re.I,
 )
 SKIP_EXT = re.compile(r"\.(xml|json|pdf|png|jpe?g|gif|svg|webp|css|js|ico|zip|mp[34])$", re.I)
@@ -101,11 +102,32 @@ def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:80] or "essay"
 
 
+def image_type(data):
+    """(media type, extension) from the file's magic bytes; servers mislabel these."""
+    if data.startswith(b"\x89PNG"):
+        return "image/png", "png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg", "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if b"<svg" in data[:500]:
+        return "image/svg+xml", "svg"
+    return None, None
+
+
 def build_epub(session, url, author):
     html = fetch(session, url).text
     doc = Document(html)
     title = doc.short_title().strip() or urlparse(url).path.strip("/")
-    body = BeautifulSoup(doc.summary(html_partial=True), "html.parser")
+    # Some pages' <title> keeps the site name, e.g. "Principles - Nabeel S. Qureshi".
+    title = re.sub(rf"\s*[-–—|]\s*{re.escape(author)}$", "", title)
+    # nabeelqu.co wraps each essay in div.article-content; readability is the fallback.
+    article = BeautifulSoup(html, "html.parser").select_one("div.article-content")
+    body = article or BeautifulSoup(doc.summary(html_partial=True), "html.parser")
+    if not body.get_text(strip=True):
+        raise ValueError("no essay text found on the page")
 
     for tag in body.find_all(["script", "style", "iframe", "form", "noscript"]):
         tag.decompose()
@@ -121,13 +143,16 @@ def build_epub(session, url, author):
         if not src or src.startswith("data:"):
             continue
         try:
-            r = fetch(session, urljoin(url, src))
+            # Ask for formats e-readers handle rather than webp/avif.
+            r = session.get(urljoin(url, src), timeout=30, headers={"Accept": "image/png,image/jpeg,image/gif"})
+            r.raise_for_status()
         except Exception:
             img.decompose()
             continue
-        ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
-        ext = {"image/png": "png", "image/gif": "gif", "image/svg+xml": "svg",
-               "image/webp": "webp"}.get(ctype, "jpg")
+        ctype, ext = image_type(r.content)
+        if not ctype:
+            img.decompose()
+            continue
         name = f"images/img{i}.{ext}"
         book.add_item(epub.EpubItem(uid=f"img{i}", file_name=name, media_type=ctype, content=r.content))
         for attr in ("srcset", "data-src", "data-srcset", "loading"):
